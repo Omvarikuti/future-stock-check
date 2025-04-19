@@ -1,133 +1,131 @@
+import os
+import json
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 from tensorflow.keras.mixed_precision import set_global_policy
+import horovod.tensorflow.keras as hvd
 from sklearn.preprocessing import MinMaxScaler
 import yfinance as yf
 import joblib
-import keras_tuner as kt
-from sklearn.model_selection import train_test_split
+import tensorflow_datasets as tfds
+from tensorflow.python.tpu import profiler as tpu_profiler
 from keras.utils import plot_model
 
-# === 1. Mixed-precision policy ===
-set_global_policy('mixed_float16')
+# === A. Cluster & Horovod Initialization ===
+hvd.init()  # Horovod: multi-node all-reduce :contentReference[oaicite:6]{index=6}
+# If not using Horovod, ensure TF_CONFIG is set for MultiWorkerMirroredStrategy/ParameterServerStrategy :contentReference[oaicite:7]{index=7}
 
-# === 2. CUDA GPU configuration ===
+# Pin GPU to be used to process local rank (one GPU per process)
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
-    # Make all GPUs visible
-    tf.config.set_visible_devices(gpus, 'GPU')
-    # Enable memory growth on each GPU
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-    print("Using GPUs:", gpus)
+    gpu = gpus[hvd.local_rank() % len(gpus)]
+    tf.config.set_visible_devices(gpu, 'GPU')
+    tf.config.experimental.set_memory_growth(gpu, True)
+    print(f"[Worker {hvd.rank()}] Using GPU:", gpu)
 
-# === 3. Distributed strategy across all GPUs ===
-strategy = tf.distribute.MirroredStrategy()
-print(f"Number of replicas in sync: {strategy.num_replicas_in_sync}")
+# === B. Performance & Precision Settings ===
+os.environ['OMP_NUM_THREADS'] = '8'  # OpenMP threads :contentReference[oaicite:8]{index=8}
+set_global_policy('mixed_float16')   # Mixed precision for tensor cores :contentReference[oaicite:9]{index=9}
+tf.config.optimizer.set_jit(True)    # XLA JIT for kernel fusion :contentReference[oaicite:10]{index=10}
+tf.config.threading.set_inter_op_parallelism_threads(2)
+tf.config.threading.set_intra_op_parallelism_threads(8)  # Threading config :contentReference[oaicite:11]{index=11}
 
-# === 4. Download and prepare data ===
+# === C. High‑Speed Networking (NCCL / RDMA) ===
+# Horovod uses NCCL by default; ensure RDMA is enabled at OS/network level for GPUDirect RDMA :contentReference[oaicite:12]{index=12}
+
+# === D. Data Pipeline ===
+def make_tf_record(dataset, filename):
+    # Example: convert Pandas to TFRecord
+    with tf.io.TFRecordWriter(filename) as writer:
+        for x, y in dataset:
+            features = {'x': tf.train.Feature(float_list=tf.train.FloatList(value=x.flatten())),
+                        'y': tf.train.Feature(float_list=tf.train.FloatList(value=[y]))}
+            example = tf.train.Example(features=tf.train.Features(feature=features))
+            writer.write(example.SerializeToString())
+
+def parse_fn(example_proto):
+    feat_desc = {'x': tf.io.FixedLenFeature([seq_length], tf.float32), 'y': tf.io.FixedLenFeature([1], tf.float32)}
+    parsed = tf.io.parse_single_example(example_proto, feat_desc)
+    return tf.reshape(parsed['x'], (seq_length, 1)), parsed['y']
+
+# Download data
 data = yf.download('INTC', start='2015-01-01', end='2025-04-18')
-y = data['Close'].values.reshape(-1, 1)
-
+y = data['Close'].values.reshape(-1,1)
 scaler = MinMaxScaler()
 y_scaled = scaler.fit_transform(y)
 
-def create_sequences(data, seq_length):
-    X, y = [], []
-    for i in range(len(data) - seq_length):
-        X.append(data[i:i + seq_length])
-        y.append(data[i + seq_length])
-    return np.array(X), np.array(y)
-
+# Sequence creation
 seq_length = 10
-X_seq, y_seq = create_sequences(y_scaled, seq_length)
-X_train, X_val, y_train, y_val = train_test_split(
-    X_seq, y_seq, test_size=0.2, shuffle=False
-)
+X, Y = [], []
+for i in range(len(y_scaled) - seq_length):
+    X.append(y_scaled[i:i+seq_length])
+    Y.append(y_scaled[i+seq_length])
+X, Y = np.array(X), np.array(Y)
 
-# === 5. Model builder for Keras Tuner ===
-def build_model(hp):
-    with strategy.scope():
-        model = keras.Sequential([
-            layers.Input((seq_length, 1)),
-            layers.LSTM(hp.Int('units', 32, 128, 32)),
-            layers.BatchNormalization(),
-            layers.Dropout(hp.Float('dropout', 0.1, 0.5, 0.1)),
-            layers.Dense(1, dtype='float32')
-        ])
-        model.compile(
-            optimizer=keras.optimizers.Adam(
-                learning_rate=hp.Choice('lr', [1e-2, 1e-3, 1e-4])
-            ),
-            loss='mse',
-            metrics=['mae']
-        )
-    return model
+# Train/val split
+split = int(0.8 * len(X))
+X_train, Y_train, X_val, Y_val = X[:split], Y[:split], X[split:], Y[split:]
 
-# === 6. Hyperparameter tuning ===
-tuner = kt.RandomSearch(
-    build_model,
-    objective='val_loss',
-    max_trials=10,
-    directory='my_dir',
-    project_name='lstm_tuning_intc'
-)
-tuner.search(X_train, y_train, epochs=50, validation_data=(X_val, y_val), verbose=0)
-best_model = tuner.get_best_models(num_models=1)[0]
+# Write TFRecord (single file per worker)
+tfrecord_file = f"data_{hvd.rank()}.tfrecord"
+make_tf_record(zip(X_train, Y_train), tfrecord_file)
 
-# === 7. Training with callbacks ===
-per_replica_bs = 32
-global_bs = per_replica_bs * strategy.num_replicas_in_sync
+# Build tf.data pipeline
+def build_dataset(filenames, batch_size):
+    ds = tf.data.TFRecordDataset(filenames)
+    ds = ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.cache()                                # Cache entries :contentReference[oaicite:13]{index=13}
+    ds = ds.shuffle(10000)                         # Shuffle buffer
+    ds = ds.batch(batch_size)
+    ds = ds.prefetch(tf.data.AUTOTUNE)             # Prefetch :contentReference[oaicite:14]{index=14}
+    return ds
+
+global_bs = 64 * hvd.size()  # Scale batch size by world size
+train_ds = build_dataset([tfrecord_file], global_bs)
+val_ds   = build_dataset([tfrecord_file], int(global_bs*0.2))
+
+# === E. Model & Horovod Distributed Optimizer ===
+with tf.distribute.MirroredStrategy().scope():
+    model = keras.Sequential([
+        layers.Input((seq_length,1)),
+        layers.LSTM(128),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        layers.Dense(1, dtype='float32')
+    ])
+    opt = keras.optimizers.Adam(1e-3 * hvd.size())
+    opt = hvd.DistributedOptimizer(opt)  # Horovod all-reduce :contentReference[oaicite:15]{index=15}
+    model.compile(optimizer=opt, loss='mse', metrics=['mae'])
+
+# === F. Callbacks & Profiler ===
 callbacks = [
-    ModelCheckpoint('best_model_intc.h5', save_best_only=True, monitor='val_loss'),
-    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+    ModelCheckpoint('best_model.h5', save_best_only=True, monitor='val_loss'),
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
 ]
-history = best_model.fit(
-    X_train, y_train,
-    epochs=50,
-    batch_size=global_bs,
-    validation_data=(X_val, y_val),
-    callbacks=callbacks,
-    verbose=1
-)
+# TensorBoard profiler
+logdir = "./logs"
+writer = tf.summary.create_file_writer(logdir)
+tf.profiler.experimental.start(logdir)  # Start profiling :contentReference[oaicite:16]{index=16}
 
-# === 8. Future predictions ===
-def predict_future(model, seq, steps):
-    preds, cur = [], seq.copy().reshape(-1, 1)
-    for _ in range(steps):
-        p = model.predict(cur[np.newaxis], verbose=0)[0, 0]
-        preds.append(p)
-        cur = np.append(cur[1:], p).reshape(-1, 1)
-    return np.array(preds)
+# === G. Training ===
+model.fit(train_ds,
+          epochs=50,
+          validation_data=val_ds,
+          callbacks=callbacks,
+          verbose=1 if hvd.rank()==0 else 0)
 
-future_scaled = predict_future(best_model, X_val[-1].flatten(), 50)
-future_preds = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
+tf.profiler.experimental.stop()  # Stop profiling
 
-# === 9. Plot results ===
-plt.figure(figsize=(12, 5))
-
-plt.subplot(1, 2, 1)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Val Loss')
-plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
-
-plt.subplot(1, 2, 2)
-orig = scaler.inverse_transform(y_scaled).flatten()
-plt.plot(orig, label='Original')
-plt.plot(range(len(orig), len(orig) + 50), future_preds, '--', label='Predicted')
-plt.xlabel('Time Step'); plt.ylabel('Price'); plt.legend()
-
-plt.tight_layout()
-plt.show()
-
-# === 10. Save artifacts ===
-best_model.save('best_lstm_model_intc.h5')
-joblib.dump(scaler, 'scaler_intc.pkl')
-pd.DataFrame(history.history).to_csv('training_history_intc.csv', index=False)
-pd.DataFrame({'Future Predictions': future_preds}).to_csv('future_predictions_intc.csv', index=False)
-plot_model(best_model, to_file='model_architecture_intc.png', show_shapes=True)
+# === H. Inference & Saving Artifacts ===
+preds = model.predict(X_val, batch_size=global_bs)
+future = scaler.inverse_transform(preds).flatten()
+if hvd.rank()==0:
+    pd.DataFrame({'Prediction': future}).to_csv('predictions.csv', index=False)
+    model.save('final_model.h5')
+    joblib.dump(scaler, 'scaler.pkl')
+    plot_model(model, to_file='model_arch.png', show_shapes=True)
