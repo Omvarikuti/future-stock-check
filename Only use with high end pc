@@ -1,0 +1,133 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.mixed_precision import set_global_policy
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
+import joblib
+import keras_tuner as kt
+from sklearn.model_selection import train_test_split
+from keras.utils import plot_model
+
+# === 1. Mixed-precision policy ===
+set_global_policy('mixed_float16')
+
+# === 2. CUDA GPU configuration ===
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    # Make all GPUs visible
+    tf.config.set_visible_devices(gpus, 'GPU')
+    # Enable memory growth on each GPU
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print("Using GPUs:", gpus)
+
+# === 3. Distributed strategy across all GPUs ===
+strategy = tf.distribute.MirroredStrategy()
+print(f"Number of replicas in sync: {strategy.num_replicas_in_sync}")
+
+# === 4. Download and prepare data ===
+data = yf.download('INTC', start='2015-01-01', end='2025-04-18')
+y = data['Close'].values.reshape(-1, 1)
+
+scaler = MinMaxScaler()
+y_scaled = scaler.fit_transform(y)
+
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+seq_length = 10
+X_seq, y_seq = create_sequences(y_scaled, seq_length)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_seq, y_seq, test_size=0.2, shuffle=False
+)
+
+# === 5. Model builder for Keras Tuner ===
+def build_model(hp):
+    with strategy.scope():
+        model = keras.Sequential([
+            layers.Input((seq_length, 1)),
+            layers.LSTM(hp.Int('units', 32, 128, 32)),
+            layers.BatchNormalization(),
+            layers.Dropout(hp.Float('dropout', 0.1, 0.5, 0.1)),
+            layers.Dense(1, dtype='float32')
+        ])
+        model.compile(
+            optimizer=keras.optimizers.Adam(
+                learning_rate=hp.Choice('lr', [1e-2, 1e-3, 1e-4])
+            ),
+            loss='mse',
+            metrics=['mae']
+        )
+    return model
+
+# === 6. Hyperparameter tuning ===
+tuner = kt.RandomSearch(
+    build_model,
+    objective='val_loss',
+    max_trials=10,
+    directory='my_dir',
+    project_name='lstm_tuning_intc'
+)
+tuner.search(X_train, y_train, epochs=50, validation_data=(X_val, y_val), verbose=0)
+best_model = tuner.get_best_models(num_models=1)[0]
+
+# === 7. Training with callbacks ===
+per_replica_bs = 32
+global_bs = per_replica_bs * strategy.num_replicas_in_sync
+callbacks = [
+    ModelCheckpoint('best_model_intc.h5', save_best_only=True, monitor='val_loss'),
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+]
+history = best_model.fit(
+    X_train, y_train,
+    epochs=50,
+    batch_size=global_bs,
+    validation_data=(X_val, y_val),
+    callbacks=callbacks,
+    verbose=1
+)
+
+# === 8. Future predictions ===
+def predict_future(model, seq, steps):
+    preds, cur = [], seq.copy().reshape(-1, 1)
+    for _ in range(steps):
+        p = model.predict(cur[np.newaxis], verbose=0)[0, 0]
+        preds.append(p)
+        cur = np.append(cur[1:], p).reshape(-1, 1)
+    return np.array(preds)
+
+future_scaled = predict_future(best_model, X_val[-1].flatten(), 50)
+future_preds = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
+
+# === 9. Plot results ===
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend()
+
+plt.subplot(1, 2, 2)
+orig = scaler.inverse_transform(y_scaled).flatten()
+plt.plot(orig, label='Original')
+plt.plot(range(len(orig), len(orig) + 50), future_preds, '--', label='Predicted')
+plt.xlabel('Time Step'); plt.ylabel('Price'); plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# === 10. Save artifacts ===
+best_model.save('best_lstm_model_intc.h5')
+joblib.dump(scaler, 'scaler_intc.pkl')
+pd.DataFrame(history.history).to_csv('training_history_intc.csv', index=False)
+pd.DataFrame({'Future Predictions': future_preds}).to_csv('future_predictions_intc.csv', index=False)
+plot_model(best_model, to_file='model_architecture_intc.png', show_shapes=True)
