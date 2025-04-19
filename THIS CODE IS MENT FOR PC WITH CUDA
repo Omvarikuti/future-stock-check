@@ -1,0 +1,131 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tensorflow import keras
+from keras import layers
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras import mixed_precision
+import joblib
+import keras_tuner as kt
+from sklearn.model_selection import train_test_split
+from keras.utils import plot_model
+
+# Set mixed precision training for faster training
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+
+# 1. Download historical stock data for Intel
+ticker = 'INTC'
+try:
+    data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
+    if data.empty:
+        raise ValueError(f"No data found for ticker {ticker}. Please check the ticker symbol.")
+except Exception as e:
+    print(f"Error downloading data for ticker {ticker}: {e}")
+    data = pd.DataFrame()
+
+# 2. Use 'Close' prices for prediction
+y = data['Close'].values.reshape(-1, 1)
+
+# 3. Normalize the data
+scaler = MinMaxScaler()
+y_scaled = scaler.fit_transform(y)
+
+# 4. Prepare sequences for LSTM (optimized with a generator if needed)
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+seq_length = 10
+X_seq, y_seq = create_sequences(y_scaled, seq_length)
+
+# 5. Split into training and validation sets
+X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, shuffle=False)
+
+# 6. Define model builder for Keras Tuner
+def build_model(hp):
+    model = keras.Sequential()
+    model.add(layers.Input(shape=(seq_length, 1)))
+    model.add(layers.LSTM(units=hp.Int('units', min_value=32, max_value=128, step=32), return_sequences=False))
+    model.add(layers.BatchNormalization())
+    model.add(layers.Dropout(rate=hp.Float('dropout', min_value=0.1, max_value=0.5, step=0.1)))
+    model.add(layers.Dense(1))
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])),
+                  loss='mse',
+                  metrics=['mae'])
+    return model
+
+# 7. Hyperparameter tuning with Keras Tuner
+tuner = kt.RandomSearch(build_model,
+                        objective='val_loss',
+                        max_trials=10,
+                        overwrite=True,
+                        directory='my_dir',
+                        project_name='lstm_tuning_intc')
+
+tuner.search(X_train, y_train, epochs=50, validation_data=(X_val, y_val), verbose=0)
+best_model = tuner.get_best_models(num_models=1)[0]
+
+# 8. Early stopping and checkpoint for the best model
+checkpoint_callback = ModelCheckpoint('best_model_intc.h5', save_best_only=True, monitor='val_loss', mode='min', verbose=1)
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+# 9. Train the best model
+history = best_model.fit(X_train, y_train, epochs=50, batch_size=64, validation_data=(X_val, y_val), verbose=0, callbacks=[early_stopping, checkpoint_callback])
+
+# 10. Predictions
+def predict_future(model, input_seq, n_steps):
+    predictions = []
+    current_input = input_seq.copy().reshape(-1, 1)
+    for _ in range(n_steps):
+        pred = model.predict(current_input[np.newaxis, :, :], verbose=0)
+        predictions.append(pred[0, 0])
+        current_input = np.append(current_input[1:], pred[0, 0]).reshape(-1, 1)
+    return np.array(predictions)
+
+future_preds_scaled = predict_future(best_model, X_val[-1].flatten(), 50)
+future_preds = scaler.inverse_transform(future_preds_scaled.reshape(-1, 1)).flatten()
+
+# 11. Plotting
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Val Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+original = scaler.inverse_transform(y_scaled).flatten()
+plt.plot(range(len(original)), original, label='Original Data')
+plt.plot(range(len(original), len(original) + 50), future_preds, label='Future Predictions', linestyle='--')
+plt.title('Original Data and Future Predictions')
+plt.xlabel('Time Step')
+plt.ylabel('Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# 12. Save the model and other outputs
+best_model.save('best_lstm_model_intc.h5')
+joblib.dump(scaler, 'scaler_intc.pkl')
+pd.DataFrame(history.history).to_csv('training_history_intc.csv', index=False)
+pd.DataFrame({'Future Predictions': future_preds}).to_csv('future_predictions_intc.csv', index=False)
+plot_model(best_model, to_file='model_architecture_intc.png', show_shapes=True, show_layer_names=True)
+
+# Save best hyperparameters
+best_hyperparameters = tuner.get_best_hyperparameters(num_trials=1)[0].values
+with open('best_hyperparameters_intc.txt', 'w') as f:
+    for key, value in best_hyperparameters.items():
+        f.write(f"{key}: {value}\n")
+
+# Save training and validation data if needed
+pd.DataFrame(X_train.reshape(X_train.shape[0], -1)).to_csv('train_data_intc.csv', index=False)
+pd.DataFrame(X_val.reshape(X_val.shape[0], -1)).to_csv('val_data_intc.csv', index=False)
