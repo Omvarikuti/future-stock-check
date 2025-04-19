@@ -1,0 +1,174 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tensorflow import keras
+from keras import layers
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
+from tqdm import tqdm
+import keras_tuner as kt
+from sklearn.model_selection import train_test_split
+import joblib
+from keras.utils import plot_model
+
+# 1. Download historical stock data for Intel
+ticker = 'INTC'
+try:
+    data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
+    if data.empty:
+        raise ValueError(f"No data found for ticker {ticker}. Please check the ticker symbol.")
+except Exception as e:
+    print(f"Error downloading data for ticker {ticker}: {e}")
+    data = pd.DataFrame()
+
+# 2. Use 'Close' prices for prediction
+y = data['Close'].values.reshape(-1, 1)
+
+# 3. Normalize the data
+scaler = MinMaxScaler()
+y_scaled = scaler.fit_transform(y)
+
+# 4. Prepare sequences for LSTM
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+seq_length = 10
+X_seq, y_seq = create_sequences(y_scaled, seq_length)
+
+# 5. Split into training and validation sets
+X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, shuffle=False)
+
+# 6. Define model builder for Keras Tuner
+def build_model(hp):
+    model = keras.Sequential()
+    model.add(layers.Input(shape=(seq_length, 1)))
+    model.add(layers.LSTM(units=hp.Int('units', min_value=32, max_value=128, step=32), return_sequences=False))
+    model.add(layers.BatchNormalization())
+    model.add(layers.Dropout(rate=hp.Float('dropout', min_value=0.1, max_value=0.5, step=0.1)))
+    model.add(layers.Dense(1))
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])),
+                  loss='mse',
+                  metrics=['mae'])
+    return model
+
+# 7. Hyperparameter tuning with Keras Tuner
+tuner = kt.RandomSearch(build_model,
+                        objective='val_loss',
+                        max_trials=10,
+                        overwrite=True,
+                        directory='my_dir',
+                        project_name='lstm_tuning_intc')
+
+tuner.search(X_train, y_train, epochs=50, validation_data=(X_val, y_val), verbose=0)
+best_models = tuner.get_best_models(num_models=1)
+if not best_models or len(best_models) == 0:
+    print("No valid models found during hyperparameter tuning. Creating a default model.")
+    best_model = build_model(kt.HyperParameters())
+else:
+    best_model = best_models[0]
+
+# 8. Early stopping to prevent overfitting
+early_stopping = keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+# 9. Train the best model with progress bar
+epochs = 50
+history = {'loss': [], 'val_loss': [], 'mae': [], 'val_mae': []}
+for epoch in tqdm(range(epochs), desc="Training Progress"):
+    hist = best_model.fit(X_train, y_train, epochs=1, validation_data=(X_val, y_val), verbose=0, callbacks=[early_stopping])
+    history['loss'].append(hist.history['loss'][0])
+    history['val_loss'].append(hist.history['val_loss'][0])
+    history['mae'].append(hist.history['mae'][0])
+    history['val_mae'].append(hist.history['val_mae'][0])
+
+# 10. Closed-loop future prediction
+def predict_future(model, input_seq, n_steps):
+    predictions = []
+    current_input = input_seq.copy().reshape(-1, 1)
+    for _ in range(n_steps):
+        pred = model.predict(current_input[np.newaxis, :, :], verbose=0)
+        predictions.append(pred[0, 0])
+        current_input = np.append(current_input[1:], pred[0, 0]).reshape(-1, 1)
+    return np.array(predictions)
+
+# Use the last sequence from validation set as seed
+seed_sequence = X_val[-1].flatten()
+future_steps = 50  
+future_preds_scaled = predict_future(best_model, seed_sequence, future_steps)
+future_preds = scaler.inverse_transform(future_preds_scaled.reshape(-1, 1)).flatten()
+
+# 11. Plotting
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(history['loss'], label='Train Loss')
+plt.plot(history['val_loss'], label='Val Loss')
+plt.plot(history['mae'], label='Train MAE')
+plt.plot(history['val_mae'], label='Val MAE')
+plt.title('Loss and MAE over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Value')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+original = scaler.inverse_transform(y_scaled).flatten()
+plt.plot(range(len(original)), original, label='Original Data')
+plt.plot(range(len(original), len(original) + future_steps), future_preds, label='Future Predictions', linestyle='--')
+plt.title('Original Data and Future Predictions')
+plt.xlabel('Time Step')
+plt.ylabel('Value')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# 12. Save the model
+best_model.save('best_lstm_model_intc.h5')
+
+# 13. Save the scaler
+joblib.dump(scaler, 'scaler_intc.pkl')
+
+# 14. Save the training history
+history_df = pd.DataFrame(history)
+history_df.to_csv('training_history_intc.csv', index=False)
+
+# 15. Save the predictions
+predictions_df = pd.DataFrame({'Future Predictions': future_preds})
+predictions_df.to_csv('future_predictions_intc.csv', index=False)
+
+# 16. Save the model summary
+with open('model_summary_intc.txt', 'w') as f:
+    best_model.summary(print_fn=lambda x: f.write(x + '\n'))
+
+# 17. Save the best hyperparameters
+best_hyperparameters = tuner.get_best_hyperparameters(num_trials=1)[0].values
+with open('best_hyperparameters_intc.txt', 'w') as f:
+    for key, value in best_hyperparameters.items():
+        f.write(f"{key}: {value}\n")
+
+# 18. Save the training and validation data
+if X_train.size > 0 and y_train.size > 0:
+    train_data = pd.DataFrame(X_train.reshape(X_train.shape[0], -1))
+    train_data['Target'] = y_train
+    train_data.to_csv('train_data_intc.csv', index=False)
+else:
+    print("Error: X_train or y_train is empty. Skipping saving train_data_intc.csv.")
+
+val_data = pd.DataFrame(X_val.reshape(X_val.shape[0], -1))
+val_data['Target'] = y_val
+val_data.to_csv('val_data_intc.csv', index=False)
+
+# 19. Save the model architecture
+plot_model(best_model, to_file='model_architecture_intc.png', show_shapes=True, show_layer_names=True)
+
+# 20. Save the training and validation loss plot
+plt.figure(figsize=(10, 5))
+plt.plot(history['loss'], label='Train Loss')
+plt.plot(history['val_loss'], label='Val Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.savefig('training_validation_loss_intc.png')
