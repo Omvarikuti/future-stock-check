@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+import os
+import argparse
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import joblib
+
+# Common
+import horovod.tensorflow.keras as hvd_tf
+import horovod.torch as hvd_torch
+from sklearn.preprocessing import MinMaxScaler
+
+# TensorFlow
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+
+# PyTorch
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
+
+# Argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--backend', choices=['tf','torch'], required=True)
+parser.add_argument('--batch_size', type=int, default=64)
+parser.add_argument('--epochs', type=int, default=50)
+parser.add_argument('--lr', type=float, default=1e-3)
+args = parser.parse_args()
+
+# Download & preprocess
+data = yf.download('INTC', start='2015-01-01', end='2025-04-18')
+prices = data['Close'].values.reshape(-1,1)
+scaler = MinMaxScaler().fit(prices)
+scaled = scaler.transform(prices)
+seq_len = 10
+X, Y = [], []
+for i in range(len(scaled)-seq_len):
+    X.append(scaled[i:i+seq_len])
+    Y.append(scaled[i+seq_len])
+X, Y = np.array(X), np.array(Y)
+split = int(0.8*len(X))
+X_train, Y_train = X[:split], Y[:split]
+X_val,   Y_val   = X[split:], Y[split:]
+
+if args.backend == 'tf':
+    # TensorFlow + Horovod
+    hvd_tf.init()
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    tf.config.optimizer.set_jit(True)
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    strategy = tf.distribute.MultiWorkerMirroredStrategy()
+    def make_ds(X, Y, bs):
+        ds = tf.data.Dataset.from_tensor_slices((X,Y))
+        return ds.cache().shuffle(1024).batch(bs).prefetch(tf.data.AUTOTUNE)
+    train_ds = make_ds(X_train, Y_train, args.batch_size)
+    val_ds   = make_ds(X_val,   Y_val,   args.batch_size)
+    with strategy.scope():
+        model = keras.Sequential([
+            layers.Input((seq_len,1)),
+            layers.LSTM(128),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(1, dtype='float32')
+        ])
+        opt = keras.optimizers.Adam(args.lr * hvd_tf.size())
+        model.compile(hvd_tf.DistributedOptimizer(opt), loss='mse', metrics=['mae'])
+    cbs = [
+        hvd_tf.callbacks.BroadcastGlobalVariablesCallback(0),
+        ModelCheckpoint('best_tf.h5', save_best_only=True, monitor='val_loss'),
+        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    ]
+    model.fit(train_ds, validation_data=val_ds, epochs=args.epochs,
+              callbacks=cbs, verbose=1 if hvd_tf.rank()==0 else 0)
+    if hvd_tf.rank()==0:
+        model.save('final_tf.h5')
+        joblib.dump(scaler, 'scaler_tf.pkl')
+
+else:
+    # PyTorch + Horovod
+    hvd_torch.init()
+    torch.cuda.set_device(hvd_torch.local_rank())
+    torch.backends.cudnn.benchmark = True
+    class TS(Dataset):
+        def __init__(self,X,Y): self.X, self.Y = torch.tensor(X), torch.tensor(Y)
+        def __len__(self): return len(self.X)
+        def __getitem__(self,i): return self.X[i], self.Y[i]
+    train_ds = TS(X_train, Y_train)
+    val_ds   = TS(X_val,   Y_val)
+    train_s = DistributedSampler(train_ds, num_replicas=hvd_torch.size(), rank=hvd_torch.rank())
+    val_s   = DistributedSampler(val_ds,   num_replicas=hvd_torch.size(), rank=hvd_torch.rank())
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_s, num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, sampler=val_s,   num_workers=4)
+    class LSTMModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(1,128,batch_first=True)
+            self.bn   = nn.BatchNorm1d(128)
+            self.fc   = nn.Linear(128,1)
+        def forward(self,x):
+            o,_ = self.lstm(x)
+            o = self.bn(o[:,-1,:])
+            return self.fc(o)
+    model = LSTMModel().cuda()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr*hvd_torch.size())
+    optimizer = hvd_torch.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
+    scaler_torch = GradScaler()
+    best_loss = float('inf')
+    for epoch in range(args.epochs):
+        model.train()
+        train_s.set_epoch(epoch)
+        for xb,yb in train_loader:
+            xb,yb = xb.cuda(), yb.cuda()
+            optimizer.zero_grad()
+            with autocast():
+                pred = model(xb)
+                loss = nn.functional.mse_loss(pred, yb)
+            scaler_torch.scale(loss).backward()
+            scaler_torch.step(optimizer)
+            scaler_torch.update()
+        model.eval()
+        vl = 0
+        for xb,yb in val_loader:
+            xb,yb = xb.cuda(), yb.cuda()
+            with torch.no_grad(), autocast():
+                vl += nn.functional.mse_loss(model(xb), yb).item()
+        vl /= len(val_loader)
+        if hvd_torch.rank()==0:
+            print(f"Epoch {epoch} Val Loss={vl:.6f}")
+            if vl<best_loss:
+                best_loss=vl
+                torch.save(model.state_dict(),'best_torch.pth')
+    if hvd_torch.rank()==0:
+        torch.save(model.state_dict(),'final_torch.pth')
+        joblib.dump(scaler, 'scaler_torch.pkl')
