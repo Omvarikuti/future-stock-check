@@ -1,0 +1,132 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tensorflow import keras
+from keras import layers
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
+import keras_tuner as kt
+from sklearn.model_selection import train_test_split
+import joblib
+from keras.utils import plot_model
+import os
+
+# Download data
+ticker = 'INTC'
+data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
+if data.empty:
+    raise ValueError(f"No data for {ticker}")
+y = data['Close'].values.reshape(-1, 1)
+
+# Scale and replicate data
+scaler = MinMaxScaler()
+y_scaled = scaler.fit_transform(y)
+y_scaled = np.tile(y_scaled, (10, 1))  # artificially enlarge dataset
+
+# Create sequences
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+seq_length = 10
+X_seq, y_seq = create_sequences(y_scaled, seq_length)
+
+# Split
+X_train, X_val, y_train, y_val = train_test_split(X_seq, y_seq, test_size=0.2, shuffle=False)
+
+# Model builder
+def build_model(hp):
+    model = keras.Sequential()
+    model.add(layers.Input(shape=(seq_length, 1)))
+    model.add(layers.LSTM(512, return_sequences=True))
+    model.add(layers.LSTM(512, return_sequences=True))
+    model.add(layers.LSTM(256))
+    model.add(layers.BatchNormalization())
+    model.add(layers.Dropout(rate=hp.Float('dropout', 0.1, 0.5, step=0.1)))
+    model.add(layers.Dense(1))
+    model.compile(optimizer=keras.optimizers.Adam(
+                    learning_rate=hp.Choice('lr', [1e-2, 1e-3, 1e-4])),
+                  loss='mse', metrics=['mae'])
+    return model
+
+# Hyperparameter tuning
+tuner = kt.RandomSearch(build_model,
+                        objective='val_loss',
+                        max_trials=100,
+                        executions_per_trial=1,
+                        overwrite=True,
+                        directory='my_dir',
+                        project_name='lstm_stress_test')
+
+tuner.search(X_train, y_train, epochs=200, validation_data=(X_val, y_val), verbose=1)
+
+# Best model
+best_model = tuner.get_best_models(num_models=1)[0]
+
+# Training loop with plotting
+epochs = 200
+history = {'loss': [], 'val_loss': [], 'mae': [], 'val_mae': []}
+os.makedirs("plots", exist_ok=True)
+for epoch in range(epochs):
+    hist = best_model.fit(X_train, y_train, epochs=1, validation_data=(X_val, y_val), verbose=1)
+    history['loss'].append(hist.history['loss'][0])
+    history['val_loss'].append(hist.history['val_loss'][0])
+    history['mae'].append(hist.history['mae'][0])
+    history['val_mae'].append(hist.history['val_mae'][0])
+    
+    # Plot every epoch
+    plt.figure(figsize=(10, 5))
+    plt.plot(history['loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.title(f'Epoch {epoch + 1}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f"plots/epoch_{epoch + 1}.png")
+    plt.close()
+
+# Predict future
+def predict_future(model, input_seq, n_steps):
+    predictions = []
+    current_input = input_seq.copy().reshape(-1, 1)
+    for _ in range(n_steps):
+        pred = model.predict(current_input[np.newaxis, :, :], verbose=0)
+        predictions.append(pred[0, 0])
+        current_input = np.append(current_input[1:], pred[0, 0]).reshape(-1, 1)
+    return np.array(predictions)
+
+seed_sequence = X_val[-1].flatten()
+future_steps = 50
+future_preds_scaled = predict_future(best_model, seed_sequence, future_steps)
+future_preds = scaler.inverse_transform(future_preds_scaled.reshape(-1, 1)).flatten()
+
+# Final plots
+plt.figure(figsize=(14, 6))
+plt.subplot(1, 2, 1)
+plt.plot(history['loss'], label='Train Loss')
+plt.plot(history['val_loss'], label='Val Loss')
+plt.plot(history['mae'], label='Train MAE')
+plt.plot(history['val_mae'], label='Val MAE')
+plt.legend()
+plt.title("Training Metrics")
+plt.subplot(1, 2, 2)
+original = scaler.inverse_transform(y_scaled).flatten()
+plt.plot(original, label='Original')
+plt.plot(range(len(original), len(original) + future_steps), future_preds, label='Predicted')
+plt.legend()
+plt.title("Future Prediction")
+plt.tight_layout()
+plt.savefig('final_training_plots.png')
+plt.show()
+
+# Save everything
+best_model.save('best_model_stress.h5')
+joblib.dump(scaler, 'scaler_stress.pkl')
+pd.DataFrame(history).to_csv('training_history_stress.csv', index=False)
+pd.DataFrame({'Future Predictions': future_preds}).to_csv('future_predictions_stress.csv', index=False)
+with open('model_summary_stress.txt', 'w') as f:
+    best_model.summary(print_fn=lambda x: f.write(x + '\n'))
+plot_model(best_model, to_file='model_architecture_stress.png', show_shapes=True)
