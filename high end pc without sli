@@ -1,112 +1,142 @@
+import os
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
 from tensorflow import keras
 from keras import layers, mixed_precision
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
 import tensorflow as tf
-from tqdm import tqdm
-import os
+import joblib
+import multiprocessing
+import threading
 
-# Use mixed precision for GPU acceleration
+# ─── CONFIGURE FOR RTX 4080 SUPER + RYZEN 9 9800X3D ─────────────────────────────
+# Enable mixed‑precision to fully utilize GPU
 mixed_precision.set_global_policy('mixed_float16')
+# Force GPU usage
+physical_gpus = tf.config.list_physical_devices('GPU')
+if physical_gpus:
+    tf.config.experimental.set_memory_growth(physical_gpus[0], True)
 
-# Create output folder
-os.makedirs('intel_lstm_mega_model', exist_ok=True)
+# ─── OUTPUT DIRECTORY ────────────────────────────────────────────────────────────
+os.makedirs('stress_intc_crash', exist_ok=True)
 
-# Download stock data
+# ─── DOWNLOAD & PREPARE DATA ────────────────────────────────────────────────────
 ticker = 'INTC'
 data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
-close_prices = data['Close'].values.reshape(-1, 1)
+if data.empty:
+    raise RuntimeError("Failed to download INTC data.")
+prices = data['Close'].values.reshape(-1,1)
 
-# Normalize
 scaler = MinMaxScaler()
-close_scaled = scaler.fit_transform(close_prices)
+scaled = scaler.fit_transform(prices)
 
-# Create sequences
-def create_sequences(data, seq_length):
+def create_sequences(arr, seq_len):
     X, y = [], []
-    for i in range(len(data) - seq_length):
-        X.append(data[i:i + seq_length])
-        y.append(data[i + seq_length])
+    for i in range(len(arr) - seq_len):
+        X.append(arr[i:i+seq_len])
+        y.append(arr[i+seq_len])
     return np.array(X), np.array(y)
 
-seq_length = 100
-X, y = create_sequences(close_scaled, seq_length)
+SEQ_LEN = 200
+X, y = create_sequences(scaled, SEQ_LEN)
 
-# Split data
+# artificially blow up memory usage
+X = np.tile(X, (4,1,1))
+y = np.tile(y, (4,1))
+
+# train / val split
 split = int(0.8 * len(X))
 X_train, X_val = X[:split], X[split:]
 y_train, y_val = y[:split], y[split:]
 
-# Define attention layer
-class AttentionLayer(layers.Layer):
-    def __init__(self):
-        super(AttentionLayer, self).__init__()
+# ─── MODEL DEFINITION (STACKED LSTM, DESIGNED TO CRASH) ─────────────────────────
+def build_model():
+    inp = keras.Input((SEQ_LEN,1))
+    x = inp
+    # 8 very large LSTM layers
+    for _ in range(8):
+        x = layers.LSTM(1024, return_sequences=True, dropout=0.5)(x)
+    x = layers.LSTM(1024, dropout=0.5)(x)
+    # deep dense head
+    for _ in range(4):
+        x = layers.Dense(2048, activation='mish')(x)
+    out = layers.Dense(1, dtype='float32')(x)
+    m = keras.Model(inp, out)
+    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mse', metrics=['mae'])
+    return m
 
-    def call(self, inputs):
-        query = key = value = inputs
-        scores = tf.matmul(query, key, transpose_b=True)
-        weights = tf.nn.softmax(scores, axis=-1)
-        return tf.matmul(weights, value)
+# ─── TRAINING FUNCTION FOR MULTI‑PROCESS STRESS ─────────────────────────────────
+def train_worker(rank):
+    model = build_model()
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val,y_val),
+        epochs=100,
+        batch_size=4096,
+        verbose=1
+    )
+    model.save(f'stress_intc_crash/model_{rank}.h5')
+    pd.DataFrame(history.history).to_csv(f'stress_intc_crash/history_{rank}.csv', index=False)
 
-# Model architecture
-def build_strong_model():
-    inputs = keras.Input(shape=(seq_length, 1))
-    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(inputs)
-    x = layers.LayerNormalization()(x)
-    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
-    x = AttentionLayer()(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(512, activation='gelu')(x)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(256, activation='gelu')(x)
-    outputs = layers.Dense(1, dtype='float32')(x)
+# ─── SPAWN TRAINING PROCESSES ───────────────────────────────────────────────────
+procs = []
+num_procs = min(multiprocessing.cpu_count(), 4)
+for i in range(num_procs):
+    p = multiprocessing.Process(target=train_worker, args=(i,))
+    p.start()
+    procs.append(p)
 
-    model = keras.Model(inputs, outputs)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss='mse', metrics=['mae'])
-    return model
+# ─── DISK & PLOTTING FLOOD IN BACKGROUND ────────────────────────────────────────
+def flood_plots():
+    while True:
+        for i in range(50):
+            plt.figure(figsize=(30,15))
+            plt.plot(np.random.randn(5000).cumsum())
+            plt.savefig(f'stress_intc_crash/plot_{i}.png')
+            plt.close()
 
-model = build_strong_model()
-model.summary()
+def flood_disk():
+    while True:
+        for i in range(100):
+            with open(f'stress_intc_crash/junk_{i}.bin','wb') as f:
+                f.write(os.urandom(100_000_000))
 
-# Training callbacks
-callbacks = [
-    keras.callbacks.ModelCheckpoint('intel_lstm_mega_model/best_model.h5', save_best_only=True),
-    keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-    keras.callbacks.ReduceLROnPlateau(monitor='val_loss', patience=5, factor=0.5, verbose=1)
-]
+threading.Thread(target=flood_plots, daemon=True).start()
+threading.Thread(target=flood_disk, daemon=True).start()
 
-# Train model
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_val, y_val),
-    epochs=100,
-    batch_size=2048,
-    callbacks=callbacks,
-    verbose=1
-)
+# ─── WAIT FOR ALL TRAINERS ─────────────────────────────────────────────────────
+for p in procs:
+    p.join()
 
-# Predict future
-def predict_future(model, last_sequence, steps):
-    predictions = []
-    current = last_sequence.reshape(-1, 1)
-    for _ in range(steps):
-        pred = model.predict(current[np.newaxis, :, :], verbose=0)[0, 0]
-        predictions.append(pred)
-        current = np.append(current[1:], [[pred]], axis=0)
-    return np.array(predictions)
+# ─── LOAD HISTORY & PLOT AGGREGATED LOSS / MAE ─────────────────────────────────
+all_hist = []
+for i in range(num_procs):
+    df = pd.read_csv(f'stress_intc_crash/history_{i}.csv')
+    all_hist.append(df)
 
-future_scaled = predict_future(model, X_val[-1], 50)
-future = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
+# combine losses by averaging
+avg_loss = np.mean([h['loss'].values for h in all_hist], axis=0)
+avg_val_loss = np.mean([h['val_loss'].values for h in all_hist], axis=0)
+avg_mae = np.mean([h['mae'].values for h in all_hist], axis=0)
+avg_val_mae = np.mean([h['val_mae'].values for h in all_hist], axis=0)
 
-# Plot predictions
-original = scaler.inverse_transform(close_scaled).flatten()
-plt.figure(figsize=(12, 6))
-plt.plot(range(len(original)), original, label='Original Data')
-plt.plot(range(len(original), len(original) + 50), future, label='Future Prediction', linestyle='--')
+plt.figure(figsize=(12,6))
+plt.plot(avg_loss, label='Avg Train Loss')
+plt.plot(avg_val_loss, label='Avg Val Loss')
+plt.plot(avg_mae, label='Avg Train MAE')
+plt.plot(avg_val_mae, label='Avg Val MAE')
+plt.title('Aggregated Training Metrics Across Processes')
+plt.xlabel('Epoch')
+plt.ylabel('Value')
 plt.legend()
-plt.title('Intel Stock Price Prediction')
-plt.savefig('intel_lstm_mega_model/predictions.png')
+plt.savefig('stress_intc_crash/aggregated_metrics.png')
 plt.show()
+
+# ─── SAVE SCALER & DATA FOR POST‑MORTEM ────────────────────────────────────────
+joblib.dump(scaler, 'stress_intc_crash/scaler.pkl')
+np.save('stress_intc_crash/X_val.npy', X_val)
+np.save('stress_intc_crash/y_val.npy', y_val)
+
+print("Done. Your 4080 Super & 9800X3D should be pushing thermal/power limits!")  
