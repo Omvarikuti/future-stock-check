@@ -1,0 +1,123 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # headless, no NSException :contentReference[oaicite:8]{index=8}
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, mixed_precision
+from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
+import joblib
+import multiprocessing
+
+# ─── CUDA/GPU SETUP ─────────────────────────────────────────────────────────────
+# Mixed precision for Tensor Cores
+mixed_precision.set_global_policy('mixed_float16')  # turn0search2turn0search14
+
+# List and verify GPUs
+gpus = tf.config.list_physical_devices('GPU')
+if not gpus:
+    raise RuntimeError("No GPU detected. Ensure CUDA drivers & cuDNN are installed.")  # turn0search0turn0search4
+
+# Enable memory growth per GPU
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)  # turn0search1
+
+# Optional: distribute across all GPUs
+strategy = tf.distribute.MirroredStrategy()  # turn0search3
+
+# ─── GLOBAL CONSTANTS & PATHS ─────────────────────────────────────────────────══
+os.makedirs('stress_intc_cuda', exist_ok=True)
+SEQ_LEN = 200
+
+# ─── DATA PREP FUNCTIONS ────────────────────────────────────────────────────────
+def create_sequences(arr, seq_len):
+    X, y = [], []
+    for i in range(len(arr) - seq_len):
+        X.append(arr[i:i + seq_len])
+        y.append(arr[i + seq_len])
+    return np.array(X), np.array(y)
+
+def load_data():
+    data = yf.download('INTC', start='2015-01-01', end='2025-04-18')
+    prices = data['Close'].values.reshape(-1,1)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices)
+    X, y = create_sequences(scaled, SEQ_LEN)
+    # inflate for stress
+    X, y = np.tile(X, (4,1,1)), np.tile(y, (4,1))
+    split = int(0.8 * len(X))
+    return X[:split], X[split:], y[:split], y[split:], scaler
+
+# ─── MODEL DEFINITION ───────────────────────────────────────────────────────────
+def build_model():
+    with strategy.scope():  # ensures multi‑GPU support if available turn0search3
+        inp = keras.Input((SEQ_LEN,1))
+        x = inp
+        for _ in range(8):
+            x = layers.LSTM(1024, return_sequences=True, dropout=0.5)(x)
+        x = layers.LSTM(1024, dropout=0.5)(x)
+        for _ in range(4):
+            x = layers.Dense(2048, activation='mish')(x)
+        out = layers.Dense(1, dtype='float32')(x)  # output in float32 for stability
+        model = keras.Model(inp, out)
+        model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        return model
+
+# ─── TRAIN WORKER ───────────────────────────────────────────────────────────────
+def train_worker(rank, X_train, X_val, y_train, y_val):
+    model = build_model()
+    hist = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=100,
+        batch_size=4096,
+        verbose=0
+    )
+    model.save(f'stress_intc_cuda/model_{rank}.h5')
+    pd.DataFrame(hist.history).to_csv(f'stress_intc_cuda/history_{rank}.csv', index=False)
+
+# ─── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    multiprocessing.set_start_method('fork', force=True)  # macOS: use fork to avoid spawn issues
+
+    X_tr, X_va, y_tr, y_va, scaler = load_data()
+
+    # Spawn parallel trainers
+    procs = []
+    N = min(multiprocessing.cpu_count(), 4)
+    for i in range(N):
+        p = multiprocessing.Process(
+            target=train_worker,
+            args=(i, X_tr, X_va, y_tr, y_va)
+        )
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+
+    # Aggregate metrics in main thread
+    all_hist = [pd.read_csv(f'stress_intc_cuda/history_{i}.csv') for i in range(N)]
+    avg_loss      = np.mean([h['loss']     for h in all_hist], axis=0)
+    avg_val_loss  = np.mean([h['val_loss'] for h in all_hist], axis=0)
+    avg_mae       = np.mean([h['mae']      for h in all_hist], axis=0)
+    avg_val_mae   = np.mean([h['val_mae']  for h in all_hist], axis=0)
+
+    plt.figure(figsize=(12,6))
+    plt.plot(avg_loss,     label='Avg Train Loss')
+    plt.plot(avg_val_loss, label='Avg Val Loss')
+    plt.plot(avg_mae,      label='Avg Train MAE')
+    plt.plot(avg_val_mae,  label='Avg Val MAE')
+    plt.xlabel('Epoch'); plt.ylabel('Value')
+    plt.legend()
+    plt.savefig('stress_intc_cuda/aggregated_metrics.png')  # headless save turn0search1
+
+    # Save scaler & validation data for post‑mortem
+    joblib.dump(scaler, 'stress_intc_cuda/scaler.pkl')
+    np.save('stress_intc_cuda/X_val.npy', X_va)
+    np.save('stress_intc_cuda/y_val.npy', y_va)
+
+    print("Completed CUDA‑enabled stress test on RTX 4080 Super!")  
