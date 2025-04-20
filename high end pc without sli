@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # ← Non‑GUI backend, prevents NSException :contentReference[oaicite:8]{index=8}
 import matplotlib.pyplot as plt
 from tensorflow import keras
 from keras import layers, mixed_precision
@@ -9,7 +11,6 @@ import yfinance as yf
 import tensorflow as tf
 import joblib
 import multiprocessing
-import threading
 
 # ─── GLOBAL SETUP ───────────────────────────────────────────────────────────────
 mixed_precision.set_global_policy('mixed_float16')
@@ -17,7 +18,7 @@ physical_gpus = tf.config.list_physical_devices('GPU')
 if physical_gpus:
     tf.config.experimental.set_memory_growth(physical_gpus[0], True)
 
-os.makedirs('stress_intc_crash', exist_ok=True)
+os.makedirs('stress_intc_fix', exist_ok=True)
 SEQ_LEN = 200
 
 # ─── DATA PREP ─────────────────────────────────────────────────────────────────
@@ -34,15 +35,14 @@ def load_data():
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(prices)
     X, y = create_sequences(scaled, SEQ_LEN)
-    # blow up memory
-    X = np.tile(X, (4,1,1))
-    y = np.tile(y, (4,1))
+    # inflate for stress
+    X, y = np.tile(X, (4,1,1)), np.tile(y, (4,1))
     split = int(0.8 * len(X))
     return X[:split], X[split:], y[:split], y[split:], scaler
 
 # ─── MODEL DEFINITION ─────────────────────────────────────────────────────────
 def build_model():
-    inp = keras.Input((SEQ_LEN, 1))
+    inp = keras.Input((SEQ_LEN,1))
     x = inp
     for _ in range(8):
         x = layers.LSTM(1024, return_sequences=True, dropout=0.5)(x)
@@ -51,55 +51,33 @@ def build_model():
         x = layers.Dense(2048, activation='mish')(x)
     out = layers.Dense(1, dtype='float32')(x)
     m = keras.Model(inp, out)
-    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mse', metrics=['mae'])
+    m.compile(optimizer='adam', loss='mse', metrics=['mae'])
     return m
 
 # ─── TRAIN WORKER ───────────────────────────────────────────────────────────────
 def train_worker(rank, X_train, X_val, y_train, y_val):
     model = build_model()
-    history = model.fit(
+    hist = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
-        epochs=100,
-        batch_size=4096,
-        verbose=1
+        epochs=100, batch_size=4096, verbose=0
     )
-    model.save(f'stress_intc_crash/model_{rank}.h5')
-    pd.DataFrame(history.history).to_csv(f'stress_intc_crash/history_{rank}.csv', index=False)
-
-# ─── BACKGROUND I/O FLOOD ───────────────────────────────────────────────────────
-def flood_plots():
-    while True:
-        for i in range(50):
-            plt.figure(figsize=(30, 15))
-            plt.plot(np.random.randn(5000).cumsum())
-            plt.savefig(f'stress_intc_crash/plot_{i}.png')
-            plt.close()
-
-def flood_disk():
-    while True:
-        for i in range(100):
-            with open(f'stress_intc_crash/junk_{i}.bin', 'wb') as f:
-                f.write(os.urandom(100_000_000))
+    model.save(f'stress_intc_fix/model_{rank}.h5')
+    pd.DataFrame(hist.history).to_csv(f'stress_intc_fix/history_{rank}.csv', index=False)
 
 # ─── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    # On Windows executables, uncomment the next line:
-    # multiprocessing.freeze_support()
+    # Optionally use fork to avoid spawn complexities :contentReference[oaicite:9]{index=9}
+    multiprocessing.set_start_method('fork', force=True)
 
-    X_train, X_val, y_train, y_val, scaler = load_data()
-
-    # Start background I/O threads
-    threading.Thread(target=flood_plots, daemon=True).start()
-    threading.Thread(target=flood_disk, daemon=True).start()
+    X_tr, X_va, y_tr, y_va, scaler = load_data()
 
     # Spawn training processes
-    procs = []
-    num_procs = min(multiprocessing.cpu_count(), 4)
-    for i in range(num_procs):
+    procs, N = [], min(multiprocessing.cpu_count(), 4)
+    for i in range(N):
         p = multiprocessing.Process(
             target=train_worker,
-            args=(i, X_train, X_val, y_train, y_val)
+            args=(i, X_tr, X_va, y_tr, y_va)
         )
         p.start()
         procs.append(p)
@@ -107,26 +85,25 @@ if __name__ == '__main__':
     for p in procs:
         p.join()
 
-    # Aggregate and plot metrics
-    all_hist = [pd.read_csv(f'stress_intc_crash/history_{i}.csv') for i in range(num_procs)]
-    avg_loss = np.mean([h['loss'].values for h in all_hist], axis=0)
-    avg_val_loss = np.mean([h['val_loss'].values for h in all_hist], axis=0)
-    avg_mae = np.mean([h['mae'].values for h in all_hist], axis=0)
-    avg_val_mae = np.mean([h['val_mae'].values for h in all_hist], axis=0)
+    # ─── AGGREGATE & PLOT IN MAIN THREAD (no NSException!) ───────────────────────
+    all_hist = [pd.read_csv(f'stress_intc_fix/history_{i}.csv') for i in range(N)]
+    avg_loss      = np.mean([h['loss']     for h in all_hist], axis=0)
+    avg_val_loss  = np.mean([h['val_loss'] for h in all_hist], axis=0)
+    avg_mae       = np.mean([h['mae']      for h in all_hist], axis=0)
+    avg_val_mae   = np.mean([h['val_mae']  for h in all_hist], axis=0)
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(avg_loss, label='Avg Train Loss')
+    plt.figure(figsize=(12,6))
+    plt.plot(avg_loss,     label='Avg Train Loss')
     plt.plot(avg_val_loss, label='Avg Val Loss')
-    plt.plot(avg_mae, label='Avg Train MAE')
-    plt.plot(avg_val_mae, label='Avg Val MAE')
-    plt.title('Aggregated Training Metrics')
-    plt.xlabel('Epoch')
-    plt.ylabel('Value')
+    plt.plot(avg_mae,      label='Avg Train MAE')
+    plt.plot(avg_val_mae,  label='Avg Val MAE')
+    plt.xlabel('Epoch'); plt.ylabel('Value')
     plt.legend()
-    plt.savefig('stress_intc_crash/aggregated_metrics.png')
-    plt.show()
+    plt.savefig('stress_intc_fix/aggregated_metrics.png')  # Safe headless save :contentReference[oaicite:10]{index=10}
 
-    # Save scaler for later
-    joblib.dump(scaler, 'stress_intc_crash/scaler.pkl')
-    np.save('stress_intc_crash/X_val.npy', X_val)
-    np.save('stress_intc_crash/y_val.npy', y_val)
+    # Save scaler & validation data
+    joblib.dump(scaler, 'stress_intc_fix/scaler.pkl')
+    np.save('stress_intc_fix/X_val.npy', X_va)
+    np.save('stress_intc_fix/y_val.npy', y_va)
+
+    print("Completed without NSException crash!")  
