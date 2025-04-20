@@ -11,55 +11,42 @@ import joblib
 import multiprocessing
 import threading
 
-# ─── CONFIGURE FOR RTX 4080 SUPER + RYZEN 9 9800X3D ─────────────────────────────
-# Enable mixed‑precision to fully utilize GPU
+# ─── GLOBAL SETUP ───────────────────────────────────────────────────────────────
 mixed_precision.set_global_policy('mixed_float16')
-# Force GPU usage
 physical_gpus = tf.config.list_physical_devices('GPU')
 if physical_gpus:
     tf.config.experimental.set_memory_growth(physical_gpus[0], True)
 
-# ─── OUTPUT DIRECTORY ────────────────────────────────────────────────────────────
 os.makedirs('stress_intc_crash', exist_ok=True)
+SEQ_LEN = 200
 
-# ─── DOWNLOAD & PREPARE DATA ────────────────────────────────────────────────────
-ticker = 'INTC'
-data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
-if data.empty:
-    raise RuntimeError("Failed to download INTC data.")
-prices = data['Close'].values.reshape(-1,1)
-
-scaler = MinMaxScaler()
-scaled = scaler.fit_transform(prices)
-
+# ─── DATA PREP ─────────────────────────────────────────────────────────────────
 def create_sequences(arr, seq_len):
     X, y = [], []
     for i in range(len(arr) - seq_len):
-        X.append(arr[i:i+seq_len])
-        y.append(arr[i+seq_len])
+        X.append(arr[i:i + seq_len])
+        y.append(arr[i + seq_len])
     return np.array(X), np.array(y)
 
-SEQ_LEN = 200
-X, y = create_sequences(scaled, SEQ_LEN)
+def load_data():
+    data = yf.download('INTC', start='2015-01-01', end='2025-04-18')
+    prices = data['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices)
+    X, y = create_sequences(scaled, SEQ_LEN)
+    # blow up memory
+    X = np.tile(X, (4,1,1))
+    y = np.tile(y, (4,1))
+    split = int(0.8 * len(X))
+    return X[:split], X[split:], y[:split], y[split:], scaler
 
-# artificially blow up memory usage
-X = np.tile(X, (4,1,1))
-y = np.tile(y, (4,1))
-
-# train / val split
-split = int(0.8 * len(X))
-X_train, X_val = X[:split], X[split:]
-y_train, y_val = y[:split], y[split:]
-
-# ─── MODEL DEFINITION (STACKED LSTM, DESIGNED TO CRASH) ─────────────────────────
+# ─── MODEL DEFINITION ─────────────────────────────────────────────────────────
 def build_model():
-    inp = keras.Input((SEQ_LEN,1))
+    inp = keras.Input((SEQ_LEN, 1))
     x = inp
-    # 8 very large LSTM layers
     for _ in range(8):
         x = layers.LSTM(1024, return_sequences=True, dropout=0.5)(x)
     x = layers.LSTM(1024, dropout=0.5)(x)
-    # deep dense head
     for _ in range(4):
         x = layers.Dense(2048, activation='mish')(x)
     out = layers.Dense(1, dtype='float32')(x)
@@ -67,12 +54,12 @@ def build_model():
     m.compile(optimizer=keras.optimizers.Adam(1e-3), loss='mse', metrics=['mae'])
     return m
 
-# ─── TRAINING FUNCTION FOR MULTI‑PROCESS STRESS ─────────────────────────────────
-def train_worker(rank):
+# ─── TRAIN WORKER ───────────────────────────────────────────────────────────────
+def train_worker(rank, X_train, X_val, y_train, y_val):
     model = build_model()
     history = model.fit(
         X_train, y_train,
-        validation_data=(X_val,y_val),
+        validation_data=(X_val, y_val),
         epochs=100,
         batch_size=4096,
         verbose=1
@@ -80,19 +67,11 @@ def train_worker(rank):
     model.save(f'stress_intc_crash/model_{rank}.h5')
     pd.DataFrame(history.history).to_csv(f'stress_intc_crash/history_{rank}.csv', index=False)
 
-# ─── SPAWN TRAINING PROCESSES ───────────────────────────────────────────────────
-procs = []
-num_procs = min(multiprocessing.cpu_count(), 4)
-for i in range(num_procs):
-    p = multiprocessing.Process(target=train_worker, args=(i,))
-    p.start()
-    procs.append(p)
-
-# ─── DISK & PLOTTING FLOOD IN BACKGROUND ────────────────────────────────────────
+# ─── BACKGROUND I/O FLOOD ───────────────────────────────────────────────────────
 def flood_plots():
     while True:
         for i in range(50):
-            plt.figure(figsize=(30,15))
+            plt.figure(figsize=(30, 15))
             plt.plot(np.random.randn(5000).cumsum())
             plt.savefig(f'stress_intc_crash/plot_{i}.png')
             plt.close()
@@ -100,43 +79,54 @@ def flood_plots():
 def flood_disk():
     while True:
         for i in range(100):
-            with open(f'stress_intc_crash/junk_{i}.bin','wb') as f:
+            with open(f'stress_intc_crash/junk_{i}.bin', 'wb') as f:
                 f.write(os.urandom(100_000_000))
 
-threading.Thread(target=flood_plots, daemon=True).start()
-threading.Thread(target=flood_disk, daemon=True).start()
+# ─── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    # On Windows executables, uncomment the next line:
+    # multiprocessing.freeze_support()
 
-# ─── WAIT FOR ALL TRAINERS ─────────────────────────────────────────────────────
-for p in procs:
-    p.join()
+    X_train, X_val, y_train, y_val, scaler = load_data()
 
-# ─── LOAD HISTORY & PLOT AGGREGATED LOSS / MAE ─────────────────────────────────
-all_hist = []
-for i in range(num_procs):
-    df = pd.read_csv(f'stress_intc_crash/history_{i}.csv')
-    all_hist.append(df)
+    # Start background I/O threads
+    threading.Thread(target=flood_plots, daemon=True).start()
+    threading.Thread(target=flood_disk, daemon=True).start()
 
-# combine losses by averaging
-avg_loss = np.mean([h['loss'].values for h in all_hist], axis=0)
-avg_val_loss = np.mean([h['val_loss'].values for h in all_hist], axis=0)
-avg_mae = np.mean([h['mae'].values for h in all_hist], axis=0)
-avg_val_mae = np.mean([h['val_mae'].values for h in all_hist], axis=0)
+    # Spawn training processes
+    procs = []
+    num_procs = min(multiprocessing.cpu_count(), 4)
+    for i in range(num_procs):
+        p = multiprocessing.Process(
+            target=train_worker,
+            args=(i, X_train, X_val, y_train, y_val)
+        )
+        p.start()
+        procs.append(p)
 
-plt.figure(figsize=(12,6))
-plt.plot(avg_loss, label='Avg Train Loss')
-plt.plot(avg_val_loss, label='Avg Val Loss')
-plt.plot(avg_mae, label='Avg Train MAE')
-plt.plot(avg_val_mae, label='Avg Val MAE')
-plt.title('Aggregated Training Metrics Across Processes')
-plt.xlabel('Epoch')
-plt.ylabel('Value')
-plt.legend()
-plt.savefig('stress_intc_crash/aggregated_metrics.png')
-plt.show()
+    for p in procs:
+        p.join()
 
-# ─── SAVE SCALER & DATA FOR POST‑MORTEM ────────────────────────────────────────
-joblib.dump(scaler, 'stress_intc_crash/scaler.pkl')
-np.save('stress_intc_crash/X_val.npy', X_val)
-np.save('stress_intc_crash/y_val.npy', y_val)
+    # Aggregate and plot metrics
+    all_hist = [pd.read_csv(f'stress_intc_crash/history_{i}.csv') for i in range(num_procs)]
+    avg_loss = np.mean([h['loss'].values for h in all_hist], axis=0)
+    avg_val_loss = np.mean([h['val_loss'].values for h in all_hist], axis=0)
+    avg_mae = np.mean([h['mae'].values for h in all_hist], axis=0)
+    avg_val_mae = np.mean([h['val_mae'].values for h in all_hist], axis=0)
 
-print("Done. Your 4080 Super & 9800X3D should be pushing thermal/power limits!")  
+    plt.figure(figsize=(12, 6))
+    plt.plot(avg_loss, label='Avg Train Loss')
+    plt.plot(avg_val_loss, label='Avg Val Loss')
+    plt.plot(avg_mae, label='Avg Train MAE')
+    plt.plot(avg_val_mae, label='Avg Val MAE')
+    plt.title('Aggregated Training Metrics')
+    plt.xlabel('Epoch')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.savefig('stress_intc_crash/aggregated_metrics.png')
+    plt.show()
+
+    # Save scaler for later
+    joblib.dump(scaler, 'stress_intc_crash/scaler.pkl')
+    np.save('stress_intc_crash/X_val.npy', X_val)
+    np.save('stress_intc_crash/y_val.npy', y_val)
