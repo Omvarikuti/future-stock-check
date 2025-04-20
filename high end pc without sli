@@ -1,28 +1,30 @@
 import numpy as np
 import pandas as pd
+import yfinance as yf
 import matplotlib.pyplot as plt
-from tensorflow import keras
-from keras import layers
 from sklearn.preprocessing import MinMaxScaler
-import keras_tuner as kt
-from keras.utils import plot_model
-import joblib
+from tensorflow import keras
+from keras import layers, mixed_precision
+import tensorflow as tf
+from tqdm import tqdm
 import os
-import multiprocessing
-import time
 
-# Setup
-os.makedirs("stress_output", exist_ok=True)
-seq_length = 100
-total_points = 500_000  # insanely large fake dataset
-future_steps = 100
+# Use mixed precision for GPU acceleration
+mixed_precision.set_global_policy('mixed_float16')
 
-# Generate synthetic data to max out memory
-print("Generating synthetic dataset...")
-y = np.sin(np.linspace(0, 1000, total_points)).reshape(-1, 1)
+# Create output folder
+os.makedirs('intel_lstm_mega_model', exist_ok=True)
+
+# Download stock data
+ticker = 'INTC'
+data = yf.download(ticker, start='2015-01-01', end='2025-04-18')
+close_prices = data['Close'].values.reshape(-1, 1)
+
+# Normalize
 scaler = MinMaxScaler()
-y_scaled = scaler.fit_transform(y)
+close_scaled = scaler.fit_transform(close_prices)
 
+# Create sequences
 def create_sequences(data, seq_length):
     X, y = [], []
     for i in range(len(data) - seq_length):
@@ -30,59 +32,81 @@ def create_sequences(data, seq_length):
         y.append(data[i + seq_length])
     return np.array(X), np.array(y)
 
-print("Creating sequences...")
-X_seq, y_seq = create_sequences(y_scaled, seq_length)
-X_seq = X_seq[:200000]  # cap to avoid memory crash
-y_seq = y_seq[:200000]
-print(f"Sequence shape: {X_seq.shape}")
+seq_length = 100
+X, y = create_sequences(close_scaled, seq_length)
 
-# Model definition
-def build_model():
-    model = keras.Sequential()
-    model.add(layers.Input(shape=(seq_length, 1)))
-    for _ in range(4):  # stack LSTM layers
-        model.add(layers.LSTM(256, return_sequences=True))
-    model.add(layers.LSTM(256))
-    model.add(layers.Dense(128, activation='relu'))
-    model.add(layers.Dense(1))
-    model.compile(optimizer='adam', loss='mse')
+# Split data
+split = int(0.8 * len(X))
+X_train, X_val = X[:split], X[split:]
+y_train, y_val = y[:split], y[split:]
+
+# Define attention layer
+class AttentionLayer(layers.Layer):
+    def __init__(self):
+        super(AttentionLayer, self).__init__()
+
+    def call(self, inputs):
+        query = key = value = inputs
+        scores = tf.matmul(query, key, transpose_b=True)
+        weights = tf.nn.softmax(scores, axis=-1)
+        return tf.matmul(weights, value)
+
+# Model architecture
+def build_strong_model():
+    inputs = keras.Input(shape=(seq_length, 1))
+    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(inputs)
+    x = layers.LayerNormalization()(x)
+    x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
+    x = AttentionLayer()(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(512, activation='gelu')(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(256, activation='gelu')(x)
+    outputs = layers.Dense(1, dtype='float32')(x)
+
+    model = keras.Model(inputs, outputs)
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=1e-4), loss='mse', metrics=['mae'])
     return model
 
-# Training function for parallel runs
-def train_model(model_id):
-    model = build_model()
-    print(f"[Model {model_id}] Training...")
-    history = model.fit(X_seq, y_seq, epochs=10, batch_size=512, verbose=1)
-    model.save(f"stress_output/model_{model_id}.h5")
-    pd.DataFrame(history.history).to_csv(f"stress_output/history_{model_id}.csv", index=False)
-    print(f"[Model {model_id}] Done.")
+model = build_strong_model()
+model.summary()
 
-# Parallel training
-num_processes = min(multiprocessing.cpu_count(), 4)
-processes = []
-for i in range(num_processes):
-    p = multiprocessing.Process(target=train_model, args=(i,))
-    p.start()
-    processes.append(p)
+# Training callbacks
+callbacks = [
+    keras.callbacks.ModelCheckpoint('intel_lstm_mega_model/best_model.h5', save_best_only=True),
+    keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    keras.callbacks.ReduceLROnPlateau(monitor='val_loss', patience=5, factor=0.5, verbose=1)
+]
 
-for p in processes:
-    p.join()
+# Train model
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=100,
+    batch_size=2048,
+    callbacks=callbacks,
+    verbose=1
+)
 
-print("🔥 ALL MODELS FINISHED TRAINING 🔥")
+# Predict future
+def predict_future(model, last_sequence, steps):
+    predictions = []
+    current = last_sequence.reshape(-1, 1)
+    for _ in range(steps):
+        pred = model.predict(current[np.newaxis, :, :], verbose=0)[0, 0]
+        predictions.append(pred)
+        current = np.append(current[1:], [[pred]], axis=0)
+    return np.array(predictions)
 
-# Constant plotting to add heat
-print("Generating massive plots...")
-for i in range(20):
-    plt.figure(figsize=(20, 10))
-    for j in range(50):
-        plt.plot(np.random.randn(1000).cumsum())
-    plt.savefig(f"stress_output/plot_{i}.png")
-    plt.close()
+future_scaled = predict_future(model, X_val[-1], 50)
+future = scaler.inverse_transform(future_scaled.reshape(-1, 1)).flatten()
 
-print("💾 Finalizing output...")
-
-# Final disk I/O dump
-joblib.dump(scaler, 'stress_output/scaler.pkl')
-np.save('stress_output/X_seq.npy', X_seq)
-np.save('stress_output/y_seq.npy', y_seq)
-print("✅ Done. MacBook should be sweating.")
+# Plot predictions
+original = scaler.inverse_transform(close_scaled).flatten()
+plt.figure(figsize=(12, 6))
+plt.plot(range(len(original)), original, label='Original Data')
+plt.plot(range(len(original), len(original) + 50), future, label='Future Prediction', linestyle='--')
+plt.legend()
+plt.title('Intel Stock Price Prediction')
+plt.savefig('intel_lstm_mega_model/predictions.png')
+plt.show()
